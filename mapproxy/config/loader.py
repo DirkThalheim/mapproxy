@@ -1,5 +1,5 @@
 # This file is part of the MapProxy project.
-# Copyright (C) 2010-2012 Omniscale <http://omniscale.de>
+# Copyright (C) 2010-2016 Omniscale <http://omniscale.de>
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -595,6 +595,71 @@ def resolution_range(conf):
                                 max_scale=conf.get('max_scale'))
 
 
+class ArcGISSourceConfiguration(SourceConfiguration):
+    source_type = ('arcgis',)
+    def __init__(self, conf, context):
+        SourceConfiguration.__init__(self, conf, context)
+
+    def source(self, params=None):
+        from mapproxy.client.arcgis import ArcGISClient
+        from mapproxy.source.arcgis import ArcGISSource
+        from mapproxy.srs import SRS
+        from mapproxy.request.arcgis import create_request
+
+        # Get the supported SRS codes and formats from the configuration.
+        supported_srs = [SRS(code) for code in self.conf.get("supported_srs", [])]
+        supported_formats = [file_ext(f) for f in self.conf.get("supported_formats", [])]
+
+        # Construct the parameters
+        if params is None:
+            params = {}
+
+        request_format = self.conf['req'].get('format')
+        if request_format:
+            params['format'] = request_format
+
+        request = create_request(self.conf["req"], params)
+        http_client, request.url = self.http_client(request.url)
+        coverage = self.coverage()
+
+        client = ArcGISClient(request, http_client)
+        image_opts = self.image_opts(format=params.get('format'))
+        return ArcGISSource(client, image_opts=image_opts, coverage=coverage,
+                            supported_srs=supported_srs,
+                            supported_formats=supported_formats or None)
+
+
+    def fi_source(self, params=None):
+        from mapproxy.client.arcgis import ArcGISInfoClient
+        from mapproxy.request.arcgis import create_identify_request
+        from mapproxy.source.arcgis import ArcGISInfoSource
+        from mapproxy.srs import SRS
+
+        if params is None: params = {}
+        request_format = self.conf['req'].get('format')
+        if request_format:
+            params['format'] = request_format
+        supported_srs = [SRS(code) for code in self.conf.get('supported_srs', [])]
+        fi_source = None
+        if self.conf.get('opts', {}).get('featureinfo', False):
+            opts = self.conf['opts']
+            tolerance = opts.get('featureinfo_tolerance', 5)
+            return_geometries = opts.get('featureinfo_return_geometries', False)
+
+            fi_request = create_identify_request(self.conf['req'], params)
+
+
+            http_client, fi_request.url = self.http_client(fi_request.url)
+            fi_client = ArcGISInfoClient(fi_request,
+                supported_srs=supported_srs,
+                http_client=http_client,
+                tolerance=tolerance,
+                return_geometries=return_geometries,
+            )
+            fi_source = ArcGISInfoSource(fi_client)
+        return fi_source
+
+
 class WMSSourceConfiguration(SourceConfiguration):
     source_type = ('wms',)
 
@@ -896,6 +961,7 @@ class DebugSourceConfiguration(SourceConfiguration):
 
 source_configuration_types = {
     'wms': WMSSourceConfiguration,
+    'arcgis': ArcGISSourceConfiguration,
     'tile': TileSourceConfiguration,
     'debug': DebugSourceConfiguration,
     'mapserver': MapServerSourceConfiguration,
@@ -918,6 +984,10 @@ class CacheConfiguration(ConfigurationBase):
         return self.context.globals.get_path('cache_dir', self.conf,
             global_key='cache.base_dir')
 
+    @memoize
+    def has_multiple_grids(self):
+        return len(self.grid_confs()) > 1
+
     def lock_dir(self):
         lock_dir = self.context.globals.get_path('cache.tile_lock_dir', self.conf)
         if not lock_dir:
@@ -930,6 +1000,11 @@ class CacheConfiguration(ConfigurationBase):
         cache_dir = self.cache_dir()
         directory_layout = self.conf.get('cache', {}).get('directory_layout', 'tc')
         if self.conf.get('cache', {}).get('directory'):
+            if self.has_multiple_grids():
+                raise ConfigurationError(
+                    "using single directory for cache with multiple grids in %s" %
+                    (self.conf['name']),
+                )
             pass
         elif self.conf.get('cache', {}).get('use_grid_names'):
             cache_dir = os.path.join(cache_dir, self.conf['name'], grid_conf.tile_grid().name)
@@ -943,13 +1018,10 @@ class CacheConfiguration(ConfigurationBase):
             log.warn('link_single_color_images not supported on windows')
             link_single_color_images = False
 
-        lock_timeout = self.context.globals.get_value('http.client_timeout', {})
-
         return FileCache(
             cache_dir,
             file_ext=file_ext,
             directory_layout=directory_layout,
-            lock_timeout=lock_timeout,
             link_single_color_images=link_single_color_images,
         )
 
@@ -965,8 +1037,77 @@ class CacheConfiguration(ConfigurationBase):
         else:
             mbfile_path = os.path.join(self.cache_dir(), filename)
 
+        sqlite_timeout = self.context.globals.get_value('cache.sqlite_timeout', self.conf)
+        wal = self.context.globals.get_value('cache.sqlite_wal', self.conf)
+
         return MBTilesCache(
             mbfile_path,
+            timeout=sqlite_timeout,
+            wal=wal,
+        )
+
+    def _geopackage_cache(self, grid_conf, file_ext):
+        from mapproxy.cache.geopackage import GeopackageCache, GeopackageLevelCache
+
+        filename = self.conf['cache'].get('filename')
+        table_name = self.conf['cache'].get('table_name') or \
+                     "{}_{}".format(self.conf['name'], grid_conf.tile_grid().name)
+        levels = self.conf['cache'].get('levels')
+
+        if not filename:
+            filename = self.conf['name'] + '.gpkg'
+        if filename.startswith('.' + os.sep):
+            gpkg_file_path = self.context.globals.abspath(filename)
+        else:
+            gpkg_file_path = os.path.join(self.cache_dir(), filename)
+
+        cache_dir = self.conf['cache'].get('directory')
+        if cache_dir:
+            cache_dir = os.path.join(
+                self.context.globals.abspath(cache_dir),
+                grid_conf.tile_grid().name
+            )
+        else:
+            cache_dir = self.cache_dir()
+            cache_dir = os.path.join(
+                cache_dir,
+                self.conf['name'],
+                grid_conf.tile_grid().name
+            )
+
+        if levels:
+            return GeopackageLevelCache(
+                cache_dir, grid_conf.tile_grid(), table_name
+            )
+        else:
+            return GeopackageCache(
+                gpkg_file_path, grid_conf.tile_grid(), table_name
+            )
+
+    def _s3_cache(self, grid_conf, file_ext):
+        from mapproxy.cache.s3 import S3Cache
+
+        bucket_name = self.context.globals.get_value('cache.bucket_name', self.conf,
+            global_key='cache.s3.bucket_name')
+
+        if not bucket_name:
+            raise ConfigurationError("no bucket_name configured for s3 cache %s" % self.conf['name'])
+
+        profile_name = self.context.globals.get_value('cache.profile_name', self.conf,
+            global_key='cache.s3.profile_name')
+
+        directory_layout = self.conf['cache'].get('directory_layout', 'tms')
+
+        base_path = self.conf['cache'].get('directory', None)
+        if base_path is None:
+            base_path = os.path.join(self.conf['name'], grid_conf.tile_grid().name)
+
+        return S3Cache(
+            base_path=base_path,
+            file_ext=file_ext,
+            directory_layout=directory_layout,
+            bucket_name=bucket_name,
+            profile_name=profile_name,
         )
 
     def _sqlite_cache(self, grid_conf, file_ext):
@@ -986,8 +1127,13 @@ class CacheConfiguration(ConfigurationBase):
                 grid_conf.tile_grid().name
             )
 
+        sqlite_timeout = self.context.globals.get_value('cache.sqlite_timeout', self.conf)
+        wal = self.context.globals.get_value('cache.sqlite_wal', self.conf)
+
         return MBTilesLevelCache(
             cache_dir,
+            timeout=sqlite_timeout,
+            wal=wal,
         )
 
     def _couchdb_cache(self, grid_conf, file_ext):
@@ -1037,6 +1183,26 @@ class CacheConfiguration(ConfigurationBase):
         return RiakCache(nodes=nodes, protocol=protocol, bucket=bucket,
             tile_grid=grid_conf.tile_grid(),
             use_secondary_index=use_secondary_index,
+        )
+
+    def _compact_cache(self, grid_conf, file_ext):
+        from mapproxy.cache.compact import CompactCacheV1
+
+        cache_dir = self.cache_dir()
+        if self.conf.get('cache', {}).get('directory'):
+            if self.has_multiple_grids():
+                raise ConfigurationError(
+                    "using single directory for cache with multiple grids in %s" %
+                    (self.conf['name']),
+                )
+            pass
+        else:
+            cache_dir = os.path.join(cache_dir, self.conf['name'], grid_conf.tile_grid().name)
+
+        if self.conf['cache']['version'] != 1:
+            raise ConfigurationError("compact cache only supports version 1")
+        return CompactCacheV1(
+            cache_dir=cache_dir,
         )
 
     def _tile_cache(self, grid_conf, file_ext):
@@ -1109,6 +1275,92 @@ class CacheConfiguration(ConfigurationBase):
             image_opts=image_opts, tiled_only=tiled_only)
         return source
 
+    def _sources_for_grid(self, source_names, grid_conf, request_format):
+        sources = []
+        source_image_opts = []
+
+        # a cache can directly access source tiles when _all_ sources are caches too
+        # and when they have compatible grids by using tiled_only on the CacheSource
+        # check if all sources support tiled_only
+        tiled_only = True
+        for source_name in source_names:
+            if source_name in self.context.sources:
+                tiled_only = False
+                break
+            elif source_name in self.context.caches:
+                cache_conf = self.context.caches[source_name]
+                tiled_only = cache_conf.supports_tiled_only_access(
+                    params={'format': request_format},
+                    tile_grid=grid_conf.tile_grid(),
+                )
+                if not tiled_only:
+                    break
+
+        for source_name in source_names:
+            if source_name in self.context.sources:
+                source_conf = self.context.sources[source_name]
+                source = source_conf.source({'format': request_format})
+            elif source_name in self.context.caches:
+                cache_conf = self.context.caches[source_name]
+                source = cache_conf.source(
+                    params={'format': request_format},
+                    tile_grid=grid_conf.tile_grid(),
+                    tiled_only=tiled_only,
+                )
+            else:
+                raise ConfigurationError('unknown source %s' % source_name)
+            if source:
+                sources.append(source)
+                source_image_opts.append(source.image_opts)
+
+        return sources, source_image_opts
+
+    def _sources_for_band_merge(self, sources_conf, grid_conf, request_format):
+        from mapproxy.image.merge import BandMerger
+
+        source_names = []
+
+        for band, band_sources in iteritems(sources_conf):
+            for source in band_sources:
+                name = source['source']
+                if name in source_names:
+                    idx = source_names.index(name)
+                else:
+                    source_names.append(name)
+                    idx = len(source_names) - 1
+
+                source["src_idx"] = idx
+
+        sources, source_image_opts = self._sources_for_grid(
+            source_names=source_names,
+            grid_conf=grid_conf,
+            request_format=request_format,
+        )
+
+        if 'l' in sources_conf:
+            mode = 'L'
+        elif 'a' in sources_conf:
+            mode = 'RGBA'
+        else:
+            mode = 'RGB'
+
+        band_merger = BandMerger(mode=mode)
+        available_bands = {'r': 0, 'g': 1, 'b': 2, 'a': 3, 'l': 0}
+        for band, band_sources in iteritems(sources_conf):
+            band_idx = available_bands.get(band)
+            if band_idx is None:
+                raise ConfigurationError("unsupported band '%s' for cache %s"
+                    % (band, self.conf['name']))
+            for source in band_sources:
+                band_merger.add_ops(
+                    dst_band=band_idx,
+                    src_img=source['src_idx'],
+                    src_band=source['band'],
+                    factor=source.get('factor', 1.0),
+                )
+
+        return band_merger.merge, sources, source_image_opts
+
     @memoize
     def caches(self):
         from mapproxy.cache.dummy import DummyCache, DummyLocker
@@ -1132,6 +1384,8 @@ class CacheConfiguration(ConfigurationBase):
             global_key='cache.meta_buffer')
         meta_size = self.context.globals.get_value('meta_size', self.conf,
             global_key='cache.meta_size')
+        bulk_meta_tiles = self.context.globals.get_value('bulk_meta_tiles', self.conf,
+            global_key='cache.bulk_meta_tiles')
         minimize_meta_requests = self.context.globals.get_value('minimize_meta_requests', self.conf,
             global_key='cache.minimize_meta_requests')
         concurrent_tile_creators = self.context.globals.get_value('concurrent_tile_creators', self.conf,
@@ -1139,43 +1393,21 @@ class CacheConfiguration(ConfigurationBase):
 
         renderd_address = self.context.globals.get_value('renderd.address', self.conf)
 
+        band_merger = None
         for grid_name, grid_conf in self.grid_confs():
-            sources = []
-            source_image_opts = []
+            if isinstance(self.conf['sources'], dict):
+                band_merger, sources, source_image_opts = self._sources_for_band_merge(
+                    self.conf['sources'],
+                    grid_conf=grid_conf,
+                    request_format=request_format,
+                )
+            else:
+                sources, source_image_opts = self._sources_for_grid(
+                    self.conf['sources'],
+                    grid_conf=grid_conf,
+                    request_format=request_format,
+                )
 
-            # a cache can directly access source tiles when _all_ sources are caches too
-            # and when they have compatible grids by using tiled_only on the CacheSource
-            # check if all sources support tiled_only
-            tiled_only = True
-            for source_name in self.conf['sources']:
-                if source_name in self.context.sources:
-                    tiled_only = False
-                    break
-                elif source_name in self.context.caches:
-                    cache_conf = self.context.caches[source_name]
-                    tiled_only = cache_conf.supports_tiled_only_access(
-                        params={'format': request_format},
-                        tile_grid=grid_conf.tile_grid(),
-                    )
-                    if not tiled_only:
-                        break
-
-            for source_name in self.conf['sources']:
-                if source_name in self.context.sources:
-                    source_conf = self.context.sources[source_name]
-                    source = source_conf.source({'format': request_format})
-                elif source_name in self.context.caches:
-                    cache_conf = self.context.caches[source_name]
-                    source = cache_conf.source(
-                        params={'format': request_format},
-                        tile_grid=grid_conf.tile_grid(),
-                        tiled_only=tiled_only,
-                    )
-                else:
-                    raise ConfigurationError('unknown source %s' % source_name)
-                if source:
-                    sources.append(source)
-                    source_image_opts.append(source.image_opts)
             if not sources:
                 from mapproxy.source import DummySource
                 sources = [DummySource()]
@@ -1213,8 +1445,13 @@ class CacheConfiguration(ConfigurationBase):
 
                 lock_timeout = self.context.globals.get_value('http.client_timeout', {})
                 locker = TileLocker(lock_dir, lock_timeout, identifier + '_renderd')
+                # TODO band_merger
                 tile_creator_class = partial(RenderdTileCreator, renderd_address,
                     priority=priority, tile_locker=locker)
+
+            else:
+                from mapproxy.cache.tile import TileCreator
+                tile_creator_class = partial(TileCreator, image_merger=band_merger)
 
             if isinstance(cache, DummyCache):
                 locker = DummyLocker()
@@ -1232,7 +1469,9 @@ class CacheConfiguration(ConfigurationBase):
                 minimize_meta_requests=minimize_meta_requests,
                 concurrent_tile_creators=concurrent_tile_creators,
                 pre_store_filter=tile_filter,
-                tile_creator_class=tile_creator_class)
+                tile_creator_class=tile_creator_class,
+                bulk_meta_tiles=bulk_meta_tiles,
+            )
             extent = merge_layer_extents(sources)
             if extent.is_default:
                 extent = map_extent_from_grid(tile_grid)
@@ -1389,7 +1628,7 @@ class LayerConfiguration(ConfigurationBase):
         return dimensions
 
     @memoize
-    def tile_layers(self):
+    def tile_layers(self, grid_name_as_path=False):
         from mapproxy.service.tile import TileLayer
         from mapproxy.cache.dummy import DummyCache
 
@@ -1420,7 +1659,6 @@ class LayerConfiguration(ConfigurationBase):
         tile_layers = []
         for cache_name in sources:
             for grid, extent, cache_source in self.context.caches[cache_name].caches():
-
                 if dimensions and not isinstance(cache_source.cache, DummyCache):
                     # caching of dimension layers is not supported yet
                     raise ConfigurationError(
@@ -1431,8 +1669,11 @@ class LayerConfiguration(ConfigurationBase):
                 md = {}
                 md['title'] = self.conf['title']
                 md['name'] = self.conf['name']
-                md['name_path'] = (self.conf['name'], grid.srs.srs_code.replace(':', '').upper())
                 md['grid_name'] = grid.name
+                if grid_name_as_path:
+                    md['name_path'] = (md['name'], md['grid_name'])
+                else:
+                    md['name_path'] = (self.conf['name'], grid.srs.srs_code.replace(':', '').upper())
                 md['name_internal'] = md['name_path'][0] + '_' + md['name_path'][1]
                 md['format'] = self.context.caches[cache_name].image_opts().format
                 md['cache_name'] = cache_name
@@ -1472,6 +1713,15 @@ def extents_for_srs(bbox_srs):
 
 
 class ServiceConfiguration(ConfigurationBase):
+    def __init__(self, conf, context):
+        if 'wms' in conf:
+            if conf['wms'] is None:
+                conf['wms'] = {}
+            if 'md' not in conf['wms']:
+                conf['wms']['md'] = {'title': 'MapProxy WMS'}
+
+        ConfigurationBase.__init__(self, conf, context)
+
     def services(self):
         services = []
         ows_services = []
@@ -1499,11 +1749,9 @@ class ServiceConfiguration(ConfigurationBase):
     def tile_layers(self, conf, use_grid_names=False):
         layers = odict()
         for layer_name, layer_conf in iteritems(self.context.layers):
-            for tile_layer in layer_conf.tile_layers():
+            for tile_layer in layer_conf.tile_layers(grid_name_as_path=use_grid_names):
                 if not tile_layer: continue
                 if use_grid_names:
-                    # new style layer names are tuples
-                    tile_layer.md['name_path'] = (tile_layer.md['name'], tile_layer.md['grid_name'])
                     layers[tile_layer.md['name_path']] = tile_layer
                 else:
                     layers[tile_layer.md['name_internal']] = tile_layer

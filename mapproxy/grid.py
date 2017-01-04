@@ -409,9 +409,16 @@ class TileGrid(object):
                 threshold = thresholds.pop() if thresholds else None
 
             if threshold_result is not None:
-                return threshold_result
+                # Use previous level that was within stretch_factor,
+                # but only if this level res is smaller then res.
+                # This fixes selection for resolutions that are closer together then stretch_factor.
+                #
+                if l_res < res:
+                    return threshold_result
 
             if l_res <= res*self.stretch_factor:
+                # l_res within stretch_factor
+                # remember this level, check for thresholds or better res in next loop
                 threshold_result = level
             prev_l_res = l_res
         return level
@@ -439,7 +446,7 @@ class TileGrid(object):
         tile_y = y/float(res*self.tile_size[1])
         return (int(math.floor(tile_x)), int(math.floor(tile_y)), level)
 
-    def flip_tile_coord(self, xxx_todo_changeme):
+    def flip_tile_coord(self, tile_coord):
         """
         Flip the tile coord on the y-axis. (Switch between bottom-left and top-left
         origin.)
@@ -450,7 +457,7 @@ class TileGrid(object):
         >>> grid.flip_tile_coord((1, 3, 2))
         (1, 0, 2)
         """
-        (x, y, z) = xxx_todo_changeme
+        (x, y, z) = tile_coord
         return (x, self.grid_sizes[z][1]-1-y, z)
 
     def supports_access_with_origin(self, origin):

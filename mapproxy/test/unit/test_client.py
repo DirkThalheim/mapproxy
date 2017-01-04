@@ -144,7 +144,7 @@ class TestHTTPClient(object):
                 assert_re(e.args[0], r'Could not verify connection to URL')
 
     def test_timeouts(self):
-        test_req = ({'path': '/', 'req_assert_function': lambda x: time.sleep(0.5) or True},
+        test_req = ({'path': '/', 'req_assert_function': lambda x: time.sleep(0.9) or True},
                     {'body': b'nothing'})
 
         import mapproxy.client.http
@@ -153,7 +153,7 @@ class TestHTTPClient(object):
         mapproxy.client.http._max_set_timeout = None
 
         client1 = HTTPClient(timeout=0.1)
-        client2 = HTTPClient(timeout=0.2)
+        client2 = HTTPClient(timeout=0.5)
         with mock_httpd(TESTSERVER_ADDRESS, [test_req]):
             try:
                 start = time.time()
@@ -174,14 +174,9 @@ class TestHTTPClient(object):
                 assert False, 'HTTPClientError expected'
             duration2 = time.time() - start
 
-        if sys.version_info >= (2, 6):
-            # check individual timeouts
-            assert 0.1 <= duration1 < 0.2
-            assert 0.2 <= duration2 < 0.3
-        else:
-            # use max timeout in Python 2.5
-            assert 0.2 <= duration1 < 0.3
-            assert 0.2 <= duration2 < 0.3
+        # check individual timeouts
+        assert 0.1 <= duration1 < 0.5, duration1
+        assert 0.5 <= duration2 < 0.9, duration2
 
         mapproxy.client.http._max_set_timeout = old_timeout
 
@@ -301,32 +296,32 @@ class TestWMSInfoClient(object):
         http = MockHTTPClient()
         wms = WMSInfoClient(req, http_client=http, supported_srs=[SRS(25832)])
         fi_req = InfoQuery((8, 50, 9, 51), (512, 512),
-                           SRS(4326), (256, 256), 'text/plain')
+                           SRS(4326), (128, 64), 'text/plain')
 
         wms.get_info(fi_req)
 
         assert wms_query_eq(http.requested[0],
             TESTSERVER_URL+'/service?map=foo&LAYERS=foo&SERVICE=WMS&FORMAT=image%2Fpng'
-                           '&REQUEST=GetFeatureInfo&HEIGHT=512&SRS=EPSG%3A25832&info_format=text/plain'
+                           '&REQUEST=GetFeatureInfo&SRS=EPSG%3A25832&info_format=text/plain'
                            '&query_layers=foo'
-                           '&VERSION=1.1.1&WIDTH=512&STYLES=&x=259&y=255'
-                           '&BBOX=428333.552496,5538630.70275,500000.0,5650300.78652')
+                           '&VERSION=1.1.1&WIDTH=512&HEIGHT=797&STYLES=&x=135&y=101'
+                           '&BBOX=428333.552496,5538630.70275,500000.0,5650300.78652'), http.requested[0]
 
     def test_transform_fi_request(self):
         req = WMS111FeatureInfoRequest(url=TESTSERVER_URL + '/service?map=foo', param={'layers':'foo', 'srs': 'EPSG:25832'})
         http = MockHTTPClient()
         wms = WMSInfoClient(req, http_client=http)
         fi_req = InfoQuery((8, 50, 9, 51), (512, 512),
-                           SRS(4326), (256, 256), 'text/plain')
+                           SRS(4326), (128, 64), 'text/plain')
 
         wms.get_info(fi_req)
 
         assert wms_query_eq(http.requested[0],
             TESTSERVER_URL+'/service?map=foo&LAYERS=foo&SERVICE=WMS&FORMAT=image%2Fpng'
-                           '&REQUEST=GetFeatureInfo&HEIGHT=512&SRS=EPSG%3A25832&info_format=text/plain'
+                           '&REQUEST=GetFeatureInfo&SRS=EPSG%3A25832&info_format=text/plain'
                            '&query_layers=foo'
-                           '&VERSION=1.1.1&WIDTH=512&STYLES=&x=259&y=255'
-                           '&BBOX=428333.552496,5538630.70275,500000.0,5650300.78652')
+                           '&VERSION=1.1.1&WIDTH=512&HEIGHT=797&STYLES=&x=135&y=101'
+                           '&BBOX=428333.552496,5538630.70275,500000.0,5650300.78652'), http.requested[0]
 
 class TestWMSMapRequest100(object):
     def setup(self):
